@@ -14,7 +14,8 @@
     "postProcessing": "Post Process",
     "history": "History",
     "debug": "Debug",
-    "about": "About"
+    "about": "About",
+    "transcribe": "Transcribe"
   },
   "onboarding": {
     "subtitle": "To get started, choose a transcription model",
@@ -461,6 +462,23 @@
       "pasteDelay": {
         "title": "Paste Delay",
         "description": "Delay before sending paste keystroke (in milliseconds). Increase if wrong text is being pasted."
+      }
+    },
+    "transcribe": {
+      "title": "Transcribe Audio File",
+      "dropZoneText": "Drag and drop an audio file here",
+      "chooseFile": "Choose File",
+      "supportedFormats": "Supports WAV, MP3, FLAC, M4A, AAC, OGG",
+      "unsupportedFormat": "Unsupported file format. Please use WAV, MP3, FLAC, M4A, AAC, or OGG.",
+      "result": "Result",
+      "copy": "Copy",
+      "copied": "Copied!",
+      "noSpeechDetected": "No speech detected in the audio file.",
+      "stage": {
+        "decoding": "Decoding audio...",
+        "loading_model": "Loading model...",
+        "transcribing": "Transcribing...",
+        "saving": "Saving..."
       }
     },
     "about": {

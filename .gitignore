@@ -37,3 +37,6 @@ blob-report/
 
 .direnv
 .envrc
+
+# Local session notes (not part of the fork)
+docs/working/

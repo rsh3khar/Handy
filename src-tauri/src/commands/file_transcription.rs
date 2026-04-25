@@ -94,14 +94,27 @@ pub async fn transcribe_audio_file(
         .map_err(|e| format!("Transcription failed: {}", e))?;
     let duration_ms = start.elapsed().as_millis() as u64;
 
-    // Stage 4: Save to history
+    // Stage 4: Save WAV copy + history entry
     emit_progress(&app, "saving", None);
-    if let Err(e) = history_manager
-        .save_transcription(samples, text.clone(), None, None)
-        .await
-    {
-        error!("Failed to save file transcription to history: {}", e);
-        // Don't fail the whole operation for a history save error
+    let sample_count = samples.len();
+    let wav_file_name = format!("handy-{}.wav", chrono::Utc::now().timestamp());
+    let wav_path = history_manager.recordings_dir().join(&wav_file_name);
+    let wav_path_for_verify = wav_path.clone();
+    let samples_for_wav = samples;
+    let wav_save_result = tokio::task::spawn_blocking(move || {
+        crate::audio_toolkit::save_wav_file(&wav_path, &samples_for_wav)
+    })
+    .await;
+
+    let wav_saved = matches!(wav_save_result, Ok(Ok(())))
+        && crate::audio_toolkit::verify_wav_file(&wav_path_for_verify, sample_count).is_ok();
+
+    if wav_saved {
+        if let Err(e) = history_manager.save_entry(wav_file_name, text.clone(), false, None, None) {
+            error!("Failed to save file transcription to history: {}", e);
+        }
+    } else {
+        error!("Skipped history entry: WAV save/verify failed for file transcription");
     }
 
     info!(

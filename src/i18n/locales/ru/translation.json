@@ -75,6 +75,10 @@
       "sense-voice-int8": {
         "name": "SenseVoice",
         "description": "Очень быстрый. Китайский, английский, японский, корейский, кантонский."
+      },
+      "gigaam-v3-e2e-ctc": {
+        "name": "GigaAM v3",
+        "description": "Распознавание русской речи. Быстро и точно."
       }
     },
     "errors": {
@@ -449,9 +453,9 @@
         "description": "Добавить пробел после вставленной транскрипции"
       },
       "keyboardImplementation": {
-        "title": "Keyboard Implementation",
-        "description": "Choose the keyboard shortcut backend.",
-        "bindingsReset": "Keyboard shortcuts were incompatible and reset to defaults"
+        "title": "Реализация клавиатуры",
+        "description": "Выберите бэкенд для клавиатурных сочетаний.",
+        "bindingsReset": "Клавиатурные сочетания были несовместимы и сброшены к значениям по умолчанию"
       },
       "paths": {
         "appData": "Данные приложения:",

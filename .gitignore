@@ -26,6 +26,8 @@ dist-ssr
 *.sln
 *.sw?
 
+.claude/
+
 /target/
 recording_*
 .crush/
@@ -40,3 +42,6 @@ blob-report/
 
 # Local session notes (not part of the fork)
 docs/working/
+
+# Nix build output
+result

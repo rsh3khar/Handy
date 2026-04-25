@@ -17,6 +17,7 @@ use tauri_nspanel::{tauri_panel, CollectionBehavior, PanelBuilder, PanelLevel};
 
 #[cfg(target_os = "linux")]
 use gtk_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
+
 #[cfg(target_os = "linux")]
 use std::env;
 
@@ -65,22 +66,27 @@ fn update_gtk_layer_shell_anchors(overlay_window: &tauri::webview::WebviewWindow
     });
 }
 
+/// Returns true when the environment variable is set to a truthy value
+/// (e.g. "1", "true", "yes", "on").
+/// "0", "false", "no", "off" and empty string are treated as falsy (case-insensitive).
+/// Returns false when the variable is not set.
+#[cfg(target_os = "linux")]
+fn env_flag_enabled(name: &str) -> bool {
+    match env::var(name) {
+        Ok(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "" | "0" | "false" | "no" | "off"
+        ),
+        Err(_) => false,
+    }
+}
+
 /// Initializes GTK layer shell for Linux overlay window
 /// Returns true if layer shell was successfully initialized, false otherwise
 #[cfg(target_os = "linux")]
 fn init_gtk_layer_shell(overlay_window: &tauri::webview::WebviewWindow) -> bool {
-    // On KDE Wayland, layer-shell init has shown protocol instability.
-    // Fall back to regular always-on-top overlay behavior (as in v0.7.1).
-    let is_wayland = env::var("WAYLAND_DISPLAY").is_ok()
-        || env::var("XDG_SESSION_TYPE")
-            .map(|v| v.eq_ignore_ascii_case("wayland"))
-            .unwrap_or(false);
-    let is_kde = env::var("XDG_CURRENT_DESKTOP")
-        .map(|v| v.to_uppercase().contains("KDE"))
-        .unwrap_or(false)
-        || env::var("KDE_SESSION_VERSION").is_ok();
-    if is_wayland && is_kde {
-        debug!("Skipping GTK layer shell init on KDE Wayland");
+    if env_flag_enabled("HANDY_NO_GTK_LAYER_SHELL") {
+        debug!("Skipping GTK layer shell init (HANDY_NO_GTK_LAYER_SHELL is enabled)");
         return false;
     }
 
@@ -137,9 +143,23 @@ fn get_monitor_with_cursor(app_handle: &AppHandle) -> Option<tauri::Monitor> {
     if let Some(mouse_location) = input::get_cursor_position(app_handle) {
         if let Ok(monitors) = app_handle.available_monitors() {
             for monitor in monitors {
-                let is_within =
-                    is_mouse_within_monitor(mouse_location, monitor.position(), monitor.size());
-                if is_within {
+                // Tauri's monitor position/size are physical pixels, but enigo
+                // may return logical coordinates (confirmed on macOS via
+                // NSEvent::mouseLocation; on Windows, GetCursorPos behavior
+                // depends on the process DPI-awareness context). Dividing by
+                // scale_factor normalizes to logical, which is safe regardless:
+                // if enigo returns logical it matches directly, and if it returns
+                // physical on a scale=1 monitor the division is a no-op.
+                let scale = monitor.scale_factor();
+                let pos = PhysicalPosition::new(
+                    (monitor.position().x as f64 / scale) as i32,
+                    (monitor.position().y as f64 / scale) as i32,
+                );
+                let size = PhysicalSize::new(
+                    (monitor.size().width as f64 / scale) as u32,
+                    (monitor.size().height as f64 / scale) as u32,
+                );
+                if is_mouse_within_monitor(mouse_location, &pos, &size) {
                     return Some(monitor);
                 }
             }
@@ -170,43 +190,53 @@ fn is_mouse_within_monitor(
         && mouse_y < (monitor_y + monitor_height as i32)
 }
 
+/// Returns overlay position in logical coordinates (points on macOS).
+///
+/// Uses monitor position/size directly rather than work_area(), which can
+/// return incorrect coordinates on macOS for monitors with negative positions.
+/// The per-platform OVERLAY_TOP_OFFSET / OVERLAY_BOTTOM_OFFSET constants
+/// already account for system chrome (menu bar, taskbar).
+///
+/// We must use LogicalPosition (not PhysicalPosition) because Tauri/tao
+/// converts PhysicalPosition using the scale factor of the monitor the window
+/// is *currently* on, which is wrong when moving cross-monitor.
 fn calculate_overlay_position(app_handle: &AppHandle) -> Option<(f64, f64)> {
-    if let Some(monitor) = get_monitor_with_cursor(app_handle) {
-        let work_area = monitor.work_area();
-        let scale = monitor.scale_factor();
-        let work_area_width = work_area.size.width as f64 / scale;
-        let work_area_height = work_area.size.height as f64 / scale;
-        let work_area_x = work_area.position.x as f64 / scale;
-        let work_area_y = work_area.position.y as f64 / scale;
+    let monitor = get_monitor_with_cursor(app_handle)?;
+    let scale = monitor.scale_factor();
+    let monitor_x = monitor.position().x as f64 / scale;
+    let monitor_y = monitor.position().y as f64 / scale;
+    let monitor_width = monitor.size().width as f64 / scale;
+    let monitor_height = monitor.size().height as f64 / scale;
 
-        let settings = settings::get_settings(app_handle);
+    let settings = settings::get_settings(app_handle);
 
-        let x = work_area_x + (work_area_width - OVERLAY_WIDTH) / 2.0;
-        let y = match settings.overlay_position {
-            OverlayPosition::Top => work_area_y + OVERLAY_TOP_OFFSET,
-            OverlayPosition::Bottom | OverlayPosition::None => {
-                work_area_y + work_area_height - OVERLAY_HEIGHT - OVERLAY_BOTTOM_OFFSET
-            }
-        };
+    let x = monitor_x + (monitor_width - OVERLAY_WIDTH) / 2.0;
+    let y = match settings.overlay_position {
+        OverlayPosition::Top => monitor_y + OVERLAY_TOP_OFFSET,
+        OverlayPosition::Bottom | OverlayPosition::None => {
+            monitor_y + monitor_height - OVERLAY_HEIGHT - OVERLAY_BOTTOM_OFFSET
+        }
+    };
 
-        return Some((x, y));
-    }
-    None
+    Some((x, y))
 }
 
 /// Creates the recording overlay window and keeps it hidden by default
 #[cfg(not(target_os = "macos"))]
 pub fn create_recording_overlay(app_handle: &AppHandle) {
-    let position = calculate_overlay_position(app_handle);
-
     // On Linux (Wayland), monitor detection often fails, but we don't need exact coordinates
-    // for Layer Shell as we use anchors. On other platforms, we require a position.
+    // for Layer Shell as we use anchors. On other platforms, we require a monitor.
     #[cfg(not(target_os = "linux"))]
-    if position.is_none() {
-        debug!("Failed to determine overlay position, not creating overlay window");
-        return;
+    {
+        let position = calculate_overlay_position(app_handle);
+        if position.is_none() {
+            debug!("Failed to determine overlay position, not creating overlay window");
+            return;
+        }
     }
 
+    // Position starts unset — update_overlay_position() sets the correct
+    // LogicalPosition before the overlay is shown.
     let mut builder = WebviewWindowBuilder::new(
         app_handle,
         "recording_overlay",
@@ -227,10 +257,11 @@ pub fn create_recording_overlay(app_handle: &AppHandle) {
     .focused(false)
     .visible(false);
 
-    if let Some((x, y)) = position {
-        builder = builder.position(x, y);
+    if let Some(data_dir) = crate::portable::data_dir() {
+        builder = builder.data_directory(data_dir.join("webview"));
     }
 
+    #[allow(unused_variables)]
     match builder.build() {
         Ok(window) => {
             #[cfg(target_os = "linux")]

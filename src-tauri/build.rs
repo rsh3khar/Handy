@@ -7,13 +7,16 @@ fn main() {
     // Linux ships transcribe-cpp as a shared libtranscribe + loadable ggml
     // backend modules (the `dynamic-backends` posture in Cargo.toml). Bake an
     // $ORIGIN-relative rpath into the `handy` binary so it finds libtranscribe
-    // next to it in the package — AppImage `usr/bin/handy` -> `usr/lib`, and
-    // deb/rpm `/usr/bin/handy` -> `/usr/lib`. transcribe's
+    // next to it in the package — deb/rpm install into the app-private
+    // `/usr/lib/Handy` (the dir tauri already uses for resources; keeps
+    // Handy's libs out of the ldconfig-scanned `/usr/lib`, issue #1639) while
+    // the AppImage keeps them in `usr/lib` (linuxdeploy's layout), hence both
+    // entries. transcribe's
     // init_backends_default() then loads the ggml modules co-located there.
     // (Windows resolves DLLs from the exe directory, so it needs no rpath;
     // macOS links transcribe-cpp statically via the `metal` feature.)
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
-        println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN/../lib");
+        println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN/../lib/Handy:$ORIGIN/../lib");
     }
 
     // Stage transcribe-cpp's shared runtime libraries (and the dlopen'd ggml
@@ -28,7 +31,75 @@ fn main() {
     // embedding pyke's /arch:AVX2 one (which crashes at startup on pre-Haswell CPUs).
     stage_onnxruntime_dll();
 
+    // Must run after transcribe staging because that helper recreates transcribe-libs/.
+    stage_vc_runtime_dlls();
+
     tauri_build::build()
+}
+
+/// Stage the MSVC runtime DLLs into `transcribe-libs/` for app-local deployment.
+///
+/// Handy's native stack links the VC++ runtime dynamically (/MD). Shipping the
+/// DLLs beside `handy.exe` covers machines with no redistributable installed and
+/// machines whose system redist is older than the CI toolset (issue #1527).
+///
+/// Driven by `HANDY_VC_REDIST_DIRS`, set by CI to the redist dirs from the same
+/// Visual Studio install that compiled the native code. Copies only the runtime
+/// DLL families Handy imports and no-ops when the env var is unset.
+fn stage_vc_runtime_dlls() {
+    use std::path::PathBuf;
+
+    println!("cargo:rerun-if-env-changed=HANDY_VC_REDIST_DIRS");
+
+    let Some(redist_dirs) = std::env::var_os("HANDY_VC_REDIST_DIRS") else {
+        return;
+    };
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
+    }
+
+    let dest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("transcribe-libs");
+    std::fs::create_dir_all(&dest).expect("create transcribe-libs staging dir");
+
+    let mut copied: Vec<String> = Vec::new();
+    for dir in std::env::split_paths(&redist_dirs) {
+        for entry in std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("HANDY_VC_REDIST_DIRS: read {}: {e}", dir.display()))
+            .flatten()
+        {
+            let src = entry.path();
+            let name = src
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string();
+            let lower = name.to_lowercase();
+            let wanted = lower.ends_with(".dll")
+                && (lower.starts_with("msvcp140")
+                    || lower.starts_with("vcruntime140")
+                    || lower.starts_with("vcomp140"));
+            if wanted {
+                std::fs::copy(&src, dest.join(&name))
+                    .unwrap_or_else(|e| panic!("copy {}: {e}", src.display()));
+                copied.push(lower);
+            }
+        }
+    }
+
+    // Fail the build rather than ship an installer that regresses issue #1527.
+    for required in ["msvcp140.dll", "vcruntime140.dll"] {
+        if !copied.iter().any(|n| n == required) {
+            panic!(
+                "HANDY_VC_REDIST_DIRS is set but {required} was not found in it; \
+                 the app-local VC++ runtime would be incomplete and Handy would \
+                 crash on machines without a current redist (issue #1527)"
+            );
+        }
+    }
+    println!(
+        "cargo:warning=Staged {} VC++ runtime DLL(s) for app-local deployment",
+        copied.len()
+    );
 }
 
 /// Copy the dynamically-linked ONNX Runtime `onnxruntime.dll` into the
@@ -89,8 +160,8 @@ fn stage_onnxruntime_dll() {
 /// ggml modules) may be the same dir — the `BTreeSet` below dedups them.
 ///
 /// Where the staged dir lands: Windows bundles it beside `handy.exe` (DLLs resolve
-/// from the exe dir); Linux maps it into `/usr/lib`, on the binary's
-/// `$ORIGIN/../lib` rpath.
+/// from the exe dir); Linux deb/rpm map it into the app-private `/usr/lib/Handy`
+/// and the AppImage into `usr/lib`, both on the binary's rpath.
 fn stage_transcribe_runtime_libs() {
     use std::collections::BTreeSet;
     use std::path::PathBuf;
@@ -122,7 +193,9 @@ fn stage_transcribe_runtime_libs() {
     let _ = std::fs::remove_dir_all(&dest);
     std::fs::create_dir_all(&dest).expect("create transcribe-libs staging dir");
 
-    let mut copied = 0usize;
+    // Collect every candidate library name first (across both dirs) so the
+    // pruning below can see each lib's whole symlink family at once.
+    let mut libs: std::collections::BTreeMap<String, PathBuf> = Default::default();
     for dir in &dirs {
         println!("cargo:rerun-if-changed={}", dir.display());
         for entry in std::fs::read_dir(dir)
@@ -132,20 +205,49 @@ fn stage_transcribe_runtime_libs() {
             let src = entry.path();
             let name = src.file_name().and_then(|s| s.to_str()).unwrap_or("");
             // Match by NAME, not extension: Linux versions its libs
-            // (libtranscribe.so.0, .so.0.0.7) and the loader needs the SONAME, so
-            // an extension-only filter would copy just the bare dev symlink and
-            // ship a broken package. `fs::copy` dereferences the version symlinks
-            // into real files.
+            // (libtranscribe.so.0, .so.0.1.3) and the loader needs the SONAME, so
+            // an extension-only filter would miss the versioned names entirely.
             let is_lib = name.ends_with(".dll")
                 || name.ends_with(".dylib")
                 || name.ends_with(".so")
                 || name.contains(".so.");
             if is_lib {
-                std::fs::copy(&src, dest.join(name))
-                    .unwrap_or_else(|e| panic!("copy {}: {e}", src.display()));
-                copied += 1;
+                libs.insert(name.to_string(), src);
             }
         }
+    }
+
+    // A Linux install dir carries each lib as a symlink chain (libfoo.so ->
+    // libfoo.so.0 -> libfoo.so.0.1.3), and tauri's deb/rpm bundlers flatten
+    // symlinks into real files — staging every name would triplicate each lib
+    // on disk and draw "not a symbolic link" warnings from ldconfig (issue
+    // #1639). Only one name per lib is ever resolved at runtime: the SONAME
+    // (`libfoo.so.N`) for the NEEDED core libs, and the bare unversioned name
+    // for the dlopen'd ggml backend modules. Stage exactly that name;
+    // `fs::copy` dereferences the symlink so the staged file is the real
+    // library.
+    let mut best: std::collections::BTreeMap<&str, (&str, &PathBuf, usize)> = Default::default();
+    for (name, src) in &libs {
+        let (stem, rank) = match split_versioned_so(name) {
+            // Windows/macOS names (.dll/.dylib) are unversioned: keep as-is.
+            None => (name.as_str(), 0),
+            // Prefer the SONAME form (exactly one numeric suffix), then the
+            // bare `.so`; fully-versioned names only as a last resort.
+            Some((stem, depth)) => (stem, if depth == 1 { 0 } else { depth + 1 }),
+        };
+        match best.get(stem) {
+            Some(&(_, _, existing)) if existing <= rank => {}
+            _ => {
+                best.insert(stem, (name, src, rank));
+            }
+        }
+    }
+
+    let mut copied = 0usize;
+    for &(name, src, _) in best.values() {
+        std::fs::copy(src, dest.join(name))
+            .unwrap_or_else(|e| panic!("copy {}: {e}", src.display()));
+        copied += 1;
     }
     if copied == 0 {
         panic!(
@@ -155,6 +257,23 @@ fn stage_transcribe_runtime_libs() {
         );
     }
     println!("cargo:warning=Staged {copied} transcribe-cpp runtime library file(s)");
+}
+
+/// Split a versioned ELF shared-library name into (stem, version depth):
+/// `libfoo.so` -> ("libfoo", 0), `libfoo.so.0` -> ("libfoo", 1),
+/// `libfoo.so.0.1.3` -> ("libfoo", 3). Returns None for names that aren't a
+/// `.so` optionally followed by dot-separated numeric components.
+fn split_versioned_so(name: &str) -> Option<(&str, usize)> {
+    let idx = name.find(".so")?;
+    let (stem, rest) = (&name[..idx], &name[idx + 3..]);
+    if rest.is_empty() {
+        return Some((stem, 0));
+    }
+    let comps: Vec<&str> = rest.strip_prefix('.')?.split('.').collect();
+    comps
+        .iter()
+        .all(|c| !c.is_empty() && c.bytes().all(|b| b.is_ascii_digit()))
+        .then_some((stem, comps.len()))
 }
 
 /// Generate tray menu translations from frontend locale files.
@@ -297,13 +416,45 @@ fn build_apple_intelligence_bridge() {
     // Check if the SDK supports FoundationModels (required for Apple Intelligence)
     let framework_path =
         Path::new(&sdk_path).join("System/Library/Frameworks/FoundationModels.framework");
-    let has_foundation_models = framework_path.exists();
+    // HANDY_FORCE_AI_STUB=1 is an explicit escape hatch: force the stub even when
+    // the active toolchain could build the real path (e.g. to skip the Swift
+    // compile, or if the auto-detection below misfires). The common CLT-only case
+    // is detected automatically just below, so this flag is rarely needed.
+    let force_stub = env::var("HANDY_FORCE_AI_STUB").as_deref() == Ok("1");
+
+    // Auto-detect a Command-Line-Tools-only toolchain. The CLT SDK contains
+    // FoundationModels.framework, so the `framework_path.exists()` check alone
+    // wrongly selects the real Swift path, which then fails to compile because
+    // the CLT `swiftc` has no FoundationModelsMacros plugin (full Xcode only).
+    // Detecting this lets a plain `cargo build` / `tauri dev` succeed without the
+    // manual flag. Skipped when SWIFTC is overridden: that signals a custom
+    // toolchain (e.g. the nixpkgs standalone-swift path supported above) whose
+    // capabilities can't be inferred from `xcode-select`.
+    let command_line_tools_only = env::var("SWIFTC").is_err() && is_command_line_tools_only();
+    if command_line_tools_only && !force_stub {
+        println!(
+            "cargo:warning=Command Line Tools-only toolchain detected; Apple Intelligence \
+             (FoundationModels) needs full Xcode. Falling back to stubs. Install Xcode and run \
+             `sudo xcode-select -s /Applications/Xcode.app`, or set HANDY_FORCE_AI_STUB=1 to \
+             silence this message."
+        );
+    }
+
+    let has_foundation_models = framework_path.exists() && !force_stub && !command_line_tools_only;
 
     let source_file = if has_foundation_models {
         println!("cargo:warning=Building with Apple Intelligence support.");
         REAL_SWIFT_FILE
     } else {
-        println!("cargo:warning=Apple Intelligence SDK not found. Building with stubs.");
+        // The SDK genuinely lacking FoundationModels is only one reason we build
+        // stubs — CLT-only detection and HANDY_FORCE_AI_STUB (each warned about
+        // above) also land here, and for those the framework does exist. Only
+        // claim it's "not found" when that's actually true.
+        if framework_path.exists() {
+            println!("cargo:warning=Building Apple Intelligence with stubs.");
+        } else {
+            println!("cargo:warning=Apple Intelligence SDK not found. Building with stubs.");
+        }
         STUB_SWIFT_FILE
     };
 
@@ -401,4 +552,28 @@ fn build_apple_intelligence_bridge() {
     }
 
     println!("cargo:rustc-link-arg=-Wl,-rpath,/usr/lib/swift");
+}
+
+/// Returns true when the active developer directory is the standalone Command
+/// Line Tools rather than a full Xcode install.
+///
+/// `xcode-select -p` prints the active developer dir; the CLT install resolves
+/// to a path ending in `CommandLineTools` (e.g. `/Library/Developer/CommandLineTools`),
+/// whereas full Xcode resolves under `Xcode.app`. A CLT-only toolchain ships
+/// FoundationModels.framework in its SDK but a `swiftc` without the
+/// FoundationModelsMacros plugin, so the Apple Intelligence Swift path cannot
+/// compile (issue #1448). On any error we conservatively return false so the
+/// existing SDK-presence check decides.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn is_command_line_tools_only() -> bool {
+    use std::process::Command;
+
+    Command::new("xcode-select")
+        .arg("-p")
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .map(|path| path.trim().ends_with("CommandLineTools"))
+        .unwrap_or(false)
 }

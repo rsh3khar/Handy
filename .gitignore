@@ -41,7 +41,7 @@ blob-report/
 .envrc
 
 # Local session notes (not part of the fork)
-docs/working/
+/docs/
 
 # Nix build output
 result

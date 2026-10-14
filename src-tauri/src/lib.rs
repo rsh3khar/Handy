@@ -648,6 +648,8 @@ pub fn run(cli_args: CliArgs) {
 
     let specta_builder = Builder::<tauri::Wry>::new()
         .commands(collect_commands![
+            commands::restore_paste_clipboard,
+            commands::get_pending_paste,
             shortcut::change_binding,
             shortcut::reset_binding,
             shortcut::change_shortcut_activation_setting,

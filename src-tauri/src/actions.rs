@@ -838,7 +838,7 @@ impl ShortcutAction for TranscribeAction {
 
                                     match utils::paste(final_text, ah_clone.clone()) {
                                         Ok(()) => debug!(
-                                            "Text pasted successfully in {:?}",
+                                            "Paste request handled in {:?} (native delivery may finish asynchronously)",
                                             paste_time.elapsed()
                                         ),
                                         Err(e) => {

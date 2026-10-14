@@ -15,7 +15,11 @@
 //! - macOS: `declareTypes:owner:` with an owner object, the pasteboard calls
 //!   `pasteboard:provideDataForType:` on read.
 //!
-//! Two rules make the receipt trustworthy:
+//! Receipts indicate data provision, not successful insertion or reader identity.
+//! macOS clipboard managers honoring the transient markers do not request text.
+//! An unrelated text reader can still consume a promise, and AppKit may cache
+//! that data without calling the provider again for the eventual paste target.
+//! Two guards reduce premature restoration:
 //!
 //! 1. Only receipts observed *after* the paste chord was injected count. A
 //!    read before that is an eager third party (clipboard manager, antivirus)
@@ -26,10 +30,9 @@
 //!
 //! The restore is additionally gated on a short quiet period after the *last*
 //! receipt, because some applications read the clipboard several times per
-//! paste (Chromium probes, then reads). A bounded timeout caps how long the
-//! transcript may occupy the clipboard; the failure mode is always "the
-//! transcript stays on the clipboard a bit longer", never "stale content gets
-//! pasted".
+//! paste. The macOS timeout reports an unconfirmed paste and retains the
+//! temporary item for explicit recovery; it must not restore on a timer.
+//! Windows retains its existing timeout policy.
 
 // The shared transaction state is compiled on all platforms (for the unit
 // tests), but only the macOS/Windows platform modules consume all of it.
@@ -39,6 +42,10 @@ use std::time::{Duration, Instant};
 
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_os = "macos")]
+mod macos_clipboard;
+#[cfg(target_os = "macos")]
+pub(crate) use macos::{cancel_pending, pending_id, restore_pending};
 #[cfg(target_os = "windows")]
 mod windows;
 
@@ -60,6 +67,7 @@ pub(crate) const RESTORE_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// When the chord could not be injected at all, no legitimate receipt can
 /// arrive, so restore quickly instead of waiting out the full timeout.
+#[cfg(any(target_os = "windows", test))]
 pub(crate) const FAILED_INJECTION_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Shared, cross-thread record of one paste transaction.
@@ -128,14 +136,47 @@ impl TxState {
     }
 }
 
+#[cfg(any(target_os = "windows", test))]
 pub(crate) enum WaitDecision {
     KeepWaiting,
     /// Stop waiting; settle the transaction (auto-submit + guarded restore).
     Finish,
 }
 
+/// macOS distinguishes successful data provision from an expired wait. A
+/// deadline is not permission to restore the clipboard under a queued paste.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, PartialEq)]
+pub(crate) enum MacWaitDecision {
+    KeepWaiting,
+    Delivered,
+    OwnershipLost,
+    Unconfirmed,
+}
+
+#[cfg(any(target_os = "macos", test))]
+pub(crate) fn evaluate_mac(state: &TxState, now: Instant) -> MacWaitDecision {
+    if state.ownership_lost {
+        return MacWaitDecision::OwnershipLost;
+    }
+    // Key injection may have partially succeeded. Never restore on that error.
+    if state.injection_failed || state.cancelled {
+        return MacWaitDecision::Unconfirmed;
+    }
+    if let Some(last) = state.last_receipt_after_injection() {
+        if now.duration_since(last) >= QUIET_PERIOD {
+            return MacWaitDecision::Delivered;
+        }
+    }
+    if now.duration_since(state.published_at) >= RESTORE_TIMEOUT {
+        return MacWaitDecision::Unconfirmed;
+    }
+    MacWaitDecision::KeepWaiting
+}
+
 /// Pure decision: given the current transaction state, keep waiting for the
 /// target to read, or finish now. Both platform event loops call this.
+#[cfg(any(target_os = "windows", test))]
 pub(crate) fn evaluate(state: &TxState, now: Instant) -> WaitDecision {
     if state.ownership_lost || state.cancelled {
         return WaitDecision::Finish;
@@ -186,10 +227,9 @@ pub(crate) fn send_chord(
 }
 
 /// Attempts the receipt-sequenced paste. Returns `Err` before anything has
-/// been published when the platform transaction cannot start, in which case
-/// the caller should fall back to the legacy paste path. On `Ok`, publishing
-/// and chord injection have completed and the guarded restore (plus
-/// auto-submit) finishes asynchronously.
+/// been published when the platform transaction cannot start. macOS callers
+/// must surface that error without falling back to timed restoration. On
+/// `Ok`, the transaction has started; data delivery is reported asynchronously.
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 pub(crate) fn try_reliable_paste(
     text: &str,
@@ -279,5 +319,65 @@ mod tests {
         let mut s = state_after_publish(Duration::from_millis(10));
         s.ownership_lost = true;
         assert!(matches!(evaluate(&s, Instant::now()), WaitDecision::Finish));
+    }
+
+    #[test]
+    fn mac_timeout_retains_unconfirmed_clipboard() {
+        let s = state_after_publish(RESTORE_TIMEOUT);
+        assert_eq!(
+            evaluate_mac(&s, Instant::now()),
+            MacWaitDecision::Unconfirmed
+        );
+    }
+
+    #[test]
+    fn mac_cancellation_does_not_restore_under_an_enqueued_paste() {
+        let mut s = state_after_publish(Duration::from_secs(1));
+        s.cancelled = true;
+        assert_eq!(
+            evaluate_mac(&s, Instant::now()),
+            MacWaitDecision::Unconfirmed
+        );
+    }
+
+    #[test]
+    fn mac_partial_injection_does_not_restore_even_with_a_read() {
+        let mut s = state_after_publish(Duration::from_secs(1));
+        s.injected_at = Some(s.published_at);
+        s.receipts.push(s.published_at + Duration::from_millis(10));
+        s.injection_failed = true;
+        assert_eq!(
+            evaluate_mac(&s, Instant::now()),
+            MacWaitDecision::Unconfirmed
+        );
+    }
+
+    #[test]
+    fn mac_eager_reader_does_not_authorize_restoration() {
+        let mut s = state_after_publish(RESTORE_TIMEOUT);
+        s.receipts.push(s.published_at);
+        s.injected_at = Some(s.published_at + Duration::from_millis(10));
+        assert_eq!(
+            evaluate_mac(&s, Instant::now()),
+            MacWaitDecision::Unconfirmed
+        );
+    }
+
+    #[test]
+    fn mac_delivery_waits_for_quiet_and_new_copy_wins() {
+        let mut s = state_after_publish(Duration::from_secs(1));
+        s.injected_at = Some(s.published_at);
+        s.receipts.push(Instant::now());
+        assert_eq!(
+            evaluate_mac(&s, Instant::now()),
+            MacWaitDecision::KeepWaiting
+        );
+        s.receipts[0] = Instant::now() - QUIET_PERIOD;
+        assert_eq!(evaluate_mac(&s, Instant::now()), MacWaitDecision::Delivered);
+        s.ownership_lost = true;
+        assert_eq!(
+            evaluate_mac(&s, Instant::now()),
+            MacWaitDecision::OwnershipLost
+        );
     }
 }

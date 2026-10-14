@@ -8,6 +8,7 @@ import {
 import { toast, Toaster } from "sonner";
 import { useTranslation } from "react-i18next";
 import { listen } from "@tauri-apps/api/event";
+import { invoke } from "@tauri-apps/api/core";
 import { platform } from "@tauri-apps/plugin-os";
 import {
   checkAccessibilityPermission,
@@ -178,6 +179,53 @@ function App() {
     });
     return () => {
       unlisten.then((fn) => fn());
+    };
+  }, [t]);
+
+  // A timed-out native paste retains both the hidden transcript and the saved
+  // clipboard until the user explicitly restores or makes a new copy.
+  useEffect(() => {
+    const showRecovery = (transactionId: number, failed = false) => {
+      const id = `paste-${transactionId}`;
+      toast.error(
+        t(
+          failed
+            ? "errors.clipboardRestoreFailed"
+            : "errors.pasteUnconfirmedTitle",
+        ),
+        {
+          id,
+          duration: Infinity,
+          description: t("errors.pasteUnconfirmed"),
+          action: {
+            label: t("errors.restoreClipboard"),
+            onClick: () => {
+              void invoke("restore_paste_clipboard", {
+                transactionId,
+              }).catch(() => {
+                showRecovery(transactionId, true);
+              });
+            },
+          },
+        },
+      );
+    };
+    const pending = listen<number>("paste-unconfirmed", (event) => {
+      showRecovery(event.payload);
+    });
+    // Reopening/reloading the settings window must retain recovery access.
+    void pending
+      .then(() => invoke<number | null>("get_pending_paste"))
+      .then((id) => {
+        if (id != null) showRecovery(id);
+      })
+      .catch(() => {});
+    const resolved = listen<number>("paste-resolved", (event) => {
+      toast.dismiss(`paste-${event.payload}`);
+    });
+    return () => {
+      void pending.then((unlisten) => unlisten());
+      void resolved.then((unlisten) => unlisten());
     };
   }, [t]);
 

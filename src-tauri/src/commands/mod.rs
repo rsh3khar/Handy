@@ -4,6 +4,48 @@ pub mod history;
 pub mod models;
 pub mod transcription;
 
+/// Return only a recovery transaction ID, never clipboard or transcript data.
+#[tauri::command]
+#[specta::specta]
+pub fn get_pending_paste() -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        crate::paste_tx::pending_id()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
+/// Restore an unconfirmed macOS paste only at the user's explicit request.
+/// Dispatch to AppKit's main thread and report the actual restoration result.
+#[tauri::command]
+#[specta::specta]
+pub async fn restore_paste_clipboard(
+    app: tauri::AppHandle,
+    transaction_id: u64,
+) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let (send, receive) = tokio::sync::oneshot::channel();
+        let app_for_restore = app.clone();
+        app.run_on_main_thread(move || {
+            let _ = send.send(crate::paste_tx::restore_pending(
+                &app_for_restore,
+                transaction_id,
+            ));
+        })
+        .map_err(|e| e.to_string())?;
+        receive.await.map_err(|e| e.to_string())?
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (app, transaction_id);
+        Err("Clipboard recovery is only available on macOS".into())
+    }
+}
+
 use crate::settings::{
     get_settings, update_checks_forced_disabled, write_settings, AppSettings, LogLevel,
 };

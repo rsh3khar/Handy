@@ -41,6 +41,7 @@ fn write_text_to_clipboard(app_handle: &AppHandle, text: &str) -> Result<(), Str
         .map_err(|e| format!("Failed to write to clipboard: {}", e))
 }
 
+#[cfg(any(not(target_os = "macos"), test))]
 fn finish_clipboard_paste(
     paste_result: Result<(), String>,
     paste_delay_after_ms: u64,
@@ -52,6 +53,7 @@ fn finish_clipboard_paste(
 }
 
 /// Pastes text using the clipboard: saves current content, writes text, sends paste keystroke, restores clipboard.
+#[cfg(not(target_os = "macos"))]
 fn paste_via_clipboard(
     text: &str,
     app_handle: &AppHandle,
@@ -803,12 +805,28 @@ pub fn paste(text: String, app_handle: AppHandle) -> Result<(), String> {
             )?;
         }
         PasteMethod::CtrlV | PasteMethod::CtrlShiftV | PasteMethod::ShiftInsert => {
+            // Clipboard preservation on macOS must use delivery-sequenced
+            // restoration even when the old experimental toggle is disabled.
+            // Never fall back to the fixed-delay path after a native error.
+            #[cfg(target_os = "macos")]
+            return with_enigo(&app_handle, |enigo| {
+                crate::paste_tx::try_reliable_paste(
+                    &text,
+                    &app_handle,
+                    &paste_method,
+                    enigo,
+                    settings.auto_submit,
+                    settings.auto_submit_key,
+                    settings.clipboard_handling,
+                )
+            });
+
             // Debug-gated receipt-sequenced paste (#502): restore the clipboard
             // after the target actually reads the transcript, not on a timer.
             // On success it fully handles the paste (including auto-submit and
             // clipboard handling) asynchronously; on failure fall through to
             // the legacy path untouched.
-            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            #[cfg(target_os = "windows")]
             if settings.reliable_paste {
                 let reliable_result = with_enigo(&app_handle, |enigo| {
                     crate::paste_tx::try_reliable_paste(
@@ -828,6 +846,7 @@ pub fn paste(text: String, app_handle: AppHandle) -> Result<(), String> {
                     }
                 }
             }
+            #[cfg(not(target_os = "macos"))]
             paste_via_clipboard(
                 &text,
                 &app_handle,

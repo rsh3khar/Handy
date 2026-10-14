@@ -7,6 +7,11 @@ edition = "2021"
 license = "MIT"
 default-run = "handy"
 
+[[test]]
+name = "macos_paste"
+path = "tests/macos_paste.rs"
+harness = false
+
 [profile.dev]
 incremental = true # Compile your binary in smaller steps.
 
